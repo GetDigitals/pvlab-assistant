@@ -67,11 +67,20 @@ export async function onRequestPost(context) {
       return jsonResponse({ error: 'Could not parse PVGIS response shape', raw: data }, 200);
     }
 
-    const annualAverage = monthly.reduce((sum, m) => sum + m.irradiation, 0) / monthly.length;
+    // MRcalc's H(h)_m fields are MONTHLY TOTALS (kWh/m²/month), not daily averages.
+    // Convert each to a daily figure, then average across the year using total days.
+    const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    const monthlyDaily = monthly.map(m => {
+      const idx = Math.max(0, Math.min(11, Math.round(m.month) - 1));
+      const days = DAYS_IN_MONTH[idx];
+      return { month: m.month, irradiation: Math.round((m.irradiation / days) * 100) / 100 };
+    });
+    const totalAnnual = monthly.reduce((sum, m) => sum + m.irradiation, 0);
+    const annualAverage = totalAnnual / 365;
 
     return jsonResponse({
       location: { lat: latitude, lon: longitude },
-      monthly,
+      monthly: monthlyDaily,
       annualAveragePeakSunHours: Math.round(annualAverage * 100) / 100,
       source: 'PVGIS (European Commission)'
     });
