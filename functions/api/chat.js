@@ -46,6 +46,14 @@ function stripThink(text) {
 
 export async function onRequestPost(context) {
   try {
+    const accessCode = context.env.ACCESS_CODE;
+    if (accessCode) {
+      const provided = context.request.headers.get('X-PVLab-Access') || '';
+      if (provided !== accessCode) {
+        return jsonResponse({ error: 'Invalid or missing access code' }, 401);
+      }
+    }
+
     const { module = 'pv', message, history = [], image } = await context.request.json();
 
     if ((!message || typeof message !== 'string') && !image) {

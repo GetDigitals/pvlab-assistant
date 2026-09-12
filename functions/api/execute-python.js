@@ -17,6 +17,14 @@ function jsonResponse(obj, status = 200) {
 
 export async function onRequestPost(context) {
   try {
+    const accessCode = context.env.ACCESS_CODE;
+    if (accessCode) {
+      const provided = context.request.headers.get('X-PVLab-Access') || '';
+      if (provided !== accessCode) {
+        return jsonResponse({ error: 'Invalid or missing access code' }, 401);
+      }
+    }
+
     const { code } = await context.request.json();
     if (!code || typeof code !== 'string') {
       return jsonResponse({ error: 'code is required' }, 400);

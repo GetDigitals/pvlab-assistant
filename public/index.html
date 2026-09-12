@@ -470,6 +470,79 @@
     padding:1px 4px;
     border-radius:2px;
   }
+  .gate-overlay{
+    position:fixed;
+    inset:0;
+    z-index:200;
+    background:
+      linear-gradient(var(--navy-deep), var(--navy-deep)),
+      repeating-linear-gradient(0deg, var(--navy-line) 0 1px, transparent 1px 28px),
+      repeating-linear-gradient(90deg, var(--navy-line) 0 1px, transparent 1px 28px);
+    background-blend-mode: normal, overlay, overlay;
+    background-color: var(--navy-deep);
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:24px;
+  }
+  .gate-overlay.hidden{ display:none; }
+  .gate-box{
+    background: var(--paper);
+    border-radius:4px;
+    padding:32px 28px;
+    max-width:360px;
+    width:100%;
+    text-align:center;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.5);
+  }
+  .gate-mark{
+    font-family: ui-monospace, 'SF Mono', Consolas, monospace;
+    font-size:11px;
+    letter-spacing:0.08em;
+    color: var(--copper);
+    margin-bottom:6px;
+  }
+  .gate-box h2{
+    margin:0 0 10px;
+    font-size:19px;
+    color: var(--ink);
+  }
+  .gate-box p{
+    font-size:12.5px;
+    color: var(--ink-soft);
+    margin:0 0 18px;
+    line-height:1.5;
+  }
+  .gate-box input{
+    width:100%;
+    padding:11px 12px;
+    border:1px solid #cdc2a3;
+    border-radius:3px;
+    font-family: Georgia, serif;
+    font-size:15px;
+    background:#fffdf7;
+    box-sizing:border-box;
+    margin-bottom:12px;
+    text-align:center;
+  }
+  .gate-box button{
+    width:100%;
+    background: var(--copper);
+    color:#fff;
+    border:none;
+    padding:11px;
+    border-radius:3px;
+    font-size:14px;
+    font-family: Georgia, serif;
+    cursor:pointer;
+  }
+  .gate-box button:hover{ background: var(--copper-bright); }
+  .gate-error{
+    color:#c0392b;
+    font-size:12px;
+    margin-top:10px;
+    min-height:14px;
+  }
   .tag{
     display:inline-flex;
     align-items:center;
@@ -530,6 +603,17 @@
 </style>
 </head>
 <body>
+
+<div id="passwordGate" class="gate-overlay">
+  <div class="gate-box">
+    <div class="gate-mark">PVLAB · ACCESS</div>
+    <h2>Enter Access Code</h2>
+    <p>This is a private preview. Ask the developer for the current access code.</p>
+    <input type="password" id="gatePassword" placeholder="Access code" autocomplete="off">
+    <button id="gateSubmit">Enter</button>
+    <div class="gate-error" id="gateError"></div>
+  </div>
+</div>
 
 <div class="app">
   <div class="rail">
@@ -719,6 +803,43 @@ let chatHistory = {
 };
 let pendingImage = null;
 const BACKEND_URL = '/api/chat';
+
+// ---- Access gate (developer-controlled password, changeable in Cloudflare dashboard) ----
+const GATE_KEY = 'pvlab_access_code';
+function getAccessCode(){ return localStorage.getItem(GATE_KEY) || ''; }
+function authHeaders(){
+  return { 'Content-Type': 'application/json', 'X-PVLab-Access': getAccessCode() };
+}
+const gateOverlay = document.getElementById('passwordGate');
+const gatePassword = document.getElementById('gatePassword');
+const gateSubmit = document.getElementById('gateSubmit');
+const gateError = document.getElementById('gateError');
+
+function showGate(message){
+  gateOverlay.classList.remove('hidden');
+  gateError.textContent = message || '';
+}
+function hideGate(){
+  gateOverlay.classList.add('hidden');
+}
+function lockOut(message){
+  localStorage.removeItem(GATE_KEY);
+  showGate(message || 'Access code invalid or expired. Please re-enter.');
+}
+
+gateSubmit.addEventListener('click', () => {
+  const val = gatePassword.value.trim();
+  if(!val) return;
+  localStorage.setItem(GATE_KEY, val);
+  hideGate();
+});
+gatePassword.addEventListener('keydown', e => { if(e.key === 'Enter') gateSubmit.click(); });
+
+if(getAccessCode()){
+  hideGate();
+} else {
+  showGate('');
+}
 const thread = document.getElementById('thread');
 const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
@@ -937,9 +1058,16 @@ async function runPythonCode(code, outputEl, btn){
   try{
     const res = await fetch('/api/execute-python', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders(),
       body: JSON.stringify({ code })
     });
+    if(res.status === 401){
+      lockOut();
+      outputEl.textContent = 'Access expired. Please re-enter the access code.';
+      btn.disabled = false;
+      btn.textContent = '▶ Run Python';
+      return;
+    }
     const data = await res.json();
     if(!res.ok || data.error){
       outputEl.textContent = 'Execution error: ' + (typeof data.error === 'string' ? data.error : JSON.stringify(data.error));
@@ -1051,9 +1179,17 @@ async function sendMessage(){
 
     const response = await fetch(BACKEND_URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders(),
       body: JSON.stringify(payload)
     });
+
+    if(response.status === 401){
+      loadingDiv.remove();
+      lockOut();
+      sendBtn.disabled = false;
+      return;
+    }
+
     const data = await response.json();
 
     if(!response.ok || data.error){
