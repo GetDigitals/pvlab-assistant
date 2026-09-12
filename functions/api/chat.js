@@ -34,7 +34,14 @@ function jsonResponse(obj, status = 200) {
 }
 
 function stripThink(text) {
-  return (text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (!text) return '';
+  let cleaned = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const idx = cleaned.search(/<think>/i);
+  if (idx !== -1) {
+    cleaned = cleaned.slice(0, idx);
+  }
+  cleaned = cleaned.trim();
+  return cleaned || 'The response got cut off while the model was still thinking — please try again, or ask a shorter/simpler question.';
 }
 
 export async function onRequestPost(context) {
