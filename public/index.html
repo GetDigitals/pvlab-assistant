@@ -543,6 +543,37 @@
     margin-top:10px;
     min-height:14px;
   }
+  .lit-result{
+    border:1px solid #cdc2a3;
+    border-radius:3px;
+    padding:12px;
+    margin-bottom:10px;
+    background:#fffdf7;
+  }
+  .lit-result a.lit-title{
+    font-weight:600;
+    color:var(--ink);
+    text-decoration:none;
+    font-size:14px;
+    line-height:1.4;
+  }
+  .lit-result a.lit-title:hover{ color: var(--copper); text-decoration:underline; }
+  .lit-meta{
+    font-size:11.5px;
+    color: var(--ink-soft);
+    margin-top:4px;
+  }
+  .lit-abstract{
+    font-size:12px;
+    color: var(--ink);
+    margin-top:8px;
+    line-height:1.5;
+  }
+  .lit-status{
+    font-size:12px;
+    color: var(--ink-soft);
+    padding:8px 0;
+  }
   .tag{
     display:inline-flex;
     align-items:center;
@@ -635,6 +666,7 @@
       <div class="label">TOOLS</div>
       <button class="mod-btn" id="openCalculators"><span class="dot"></span>🧮 Quick Calculators</button>
       <button class="mod-btn" id="openFormulas"><span class="dot"></span>📖 Formula Reference</button>
+      <button class="mod-btn" id="openLiterature"><span class="dot"></span>🔎 Literature Search</button>
     </div>
     <div class="rail-foot">
       STANDARDS: IEC / IEEE<br>
@@ -744,6 +776,21 @@
         <p>P = V · I = I² · R = V² ÷ R</p>
       </details>
     </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="literatureModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>🔎 Literature Search</h3>
+      <button class="modal-close" data-close="literatureModal">✕</button>
+    </div>
+    <p style="font-size:12px;color:var(--ink-soft);margin:0 0 12px;">Real papers from Semantic Scholar — every result links to a real source. Nothing here is invented.</p>
+    <div style="display:flex;gap:8px;margin-bottom:14px;">
+      <input type="text" id="litQuery" placeholder="e.g. MPPT perturb and observe algorithm" style="flex:1;padding:9px 10px;border:1px solid #cdc2a3;border-radius:3px;font-family:Georgia,serif;font-size:14px;background:#fffdf7;">
+      <button class="run-btn" id="litSearchBtn">Search</button>
+    </div>
+    <div id="litResults"></div>
   </div>
 </div>
 
@@ -1225,6 +1272,7 @@ function closeModal(id){ document.getElementById(id).classList.remove('open'); }
 
 document.getElementById('openCalculators').addEventListener('click', () => openModal('calcModal'));
 document.getElementById('openFormulas').addEventListener('click', () => openModal('formulaModal'));
+document.getElementById('openLiterature').addEventListener('click', () => openModal('literatureModal'));
 document.querySelectorAll('.modal-close').forEach(btn => {
   btn.addEventListener('click', () => closeModal(btn.dataset.close));
 });
@@ -1303,6 +1351,53 @@ document.getElementById('ohm_calc').addEventListener('click', () => {
     resultEl.textContent = 'Could not solve with these inputs.';
   }
 });
+
+// ---- Literature Search (real papers, Semantic Scholar) ------------------
+function escapeAttr(s){
+  return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function runLiteratureSearch(){
+  const q = document.getElementById('litQuery').value.trim();
+  const resultsEl = document.getElementById('litResults');
+  if(!q){ resultsEl.innerHTML = '<div class="lit-status">Enter a topic or keywords to search.</div>'; return; }
+  resultsEl.innerHTML = '<div class="lit-status">Searching Semantic Scholar…</div>';
+  try{
+    const res = await fetch('/api/literature-search', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ query: q })
+    });
+    if(res.status === 401){
+      lockOut();
+      resultsEl.innerHTML = '<div class="lit-status">Access expired. Please re-enter the access code.</div>';
+      return;
+    }
+    const data = await res.json();
+    if(!res.ok || data.error){
+      resultsEl.innerHTML = '<div class="lit-status">Search failed: ' + escapeHtml(typeof data.error === 'string' ? data.error : JSON.stringify(data.error)) + '</div>';
+      return;
+    }
+    if(!data.results || !data.results.length){
+      resultsEl.innerHTML = '<div class="lit-status">No results found — try different keywords.</div>';
+      return;
+    }
+    resultsEl.innerHTML = data.results.map(p => {
+      const meta = [p.year, p.venue, p.authors].filter(Boolean).join(' · ');
+      const cite = p.citationCount !== null ? `${p.citationCount} citations` : '';
+      return `<div class="lit-result">
+        <a class="lit-title" href="${escapeAttr(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a>
+        <div class="lit-meta">${escapeHtml(meta)}${cite ? ' · ' + escapeHtml(cite) : ''}${p.doi ? ' · DOI: ' + escapeHtml(p.doi) : ''}</div>
+        ${p.abstract ? `<div class="lit-abstract">${escapeHtml(p.abstract)}</div>` : ''}
+      </div>`;
+    }).join('');
+  }catch(e){
+    resultsEl.innerHTML = '<div class="lit-status">Could not reach the search service: ' + escapeHtml(e.message) + '</div>';
+  }
+}
+
+document.getElementById('litSearchBtn').addEventListener('click', runLiteratureSearch);
+document.getElementById('litQuery').addEventListener('keydown', e => { if(e.key === 'Enter') runLiteratureSearch(); });
 </script>
 
 </body>
