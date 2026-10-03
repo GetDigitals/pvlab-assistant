@@ -668,6 +668,10 @@
       <button class="mod-btn" id="openFormulas"><span class="dot"></span>📖 Formula Reference</button>
       <button class="mod-btn" id="openLiterature"><span class="dot"></span>🔎 Literature Search</button>
     </div>
+    <div class="modules">
+      <div class="label">ACCOUNT</div>
+      <button class="mod-btn" id="openAccount"><span class="dot"></span>👤 <span id="accountBtnLabel">Sign up / Log in</span></button>
+    </div>
     <div class="rail-foot">
       STANDARDS: IEC / IEEE<br>
       ACADEMIC: MESRS (DZ)<br>
@@ -681,7 +685,7 @@
       <div class="ctx"><button class="clear-btn" id="clearHistory" title="Clear this conversation">🗑 Clear</button> Biskra, DZ · GMT+1</div>
     </div>
     <div class="thread" id="thread"></div>
-    <div class="hint">Connected to local PVLab backend (Groq / openai/gpt-oss-120b). Literature-search and irradiance-data API hookups (Semantic Scholar / PVGIS) are not wired up yet in this prototype.</div>
+    <div class="hint">Connected to PVLab backend (Groq / openai/gpt-oss-120b). Literature Search (Semantic Scholar) and real irradiance data (PVGIS) are live — see the TOOLS section in the sidebar.</div>
     <div class="image-preview" id="imagePreview">
       <img id="previewImg" src="" alt="attached image">
       <button id="removeImage">✕</button>
@@ -798,6 +802,47 @@
       <button class="run-btn" id="litSearchBtn">Search</button>
     </div>
     <div id="litResults"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="accountModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>👤 Your Account</h3>
+      <button class="modal-close" data-close="accountModal">✕</button>
+    </div>
+
+    <div id="accountLoggedOut">
+      <p style="font-size:12px;color:var(--ink-soft);margin:0 0 12px;">Create a free account so PVLab remembers your subjects, preferences, and ongoing work across sessions — not just this browser.</p>
+      <label>Email</label>
+      <input type="email" id="acctEmail" placeholder="you@example.com">
+      <label>Password</label>
+      <input type="password" id="acctPassword" placeholder="6+ characters">
+      <div style="display:flex;gap:8px;margin-top:10px;">
+        <button class="run-btn" id="acctLoginBtn" style="flex:1;">Log in</button>
+        <button class="run-btn" id="acctSignupBtn" style="flex:1;">Sign up</button>
+      </div>
+      <div class="calc-result" id="acctStatus" style="display:none;"></div>
+    </div>
+
+    <div id="accountLoggedIn" style="display:none;">
+      <p style="font-size:12px;color:var(--ink-soft);margin:0 0 4px;">Logged in as <b id="acctEmailShown"></b></p>
+
+      <details style="margin-top:14px;">
+        <summary>🧠 Your saved memory</summary>
+        <div id="memoryList" style="font-size:12.5px;color:var(--ink-soft);margin-top:8px;">Loading…</div>
+      </details>
+
+      <details style="margin-top:10px;">
+        <summary>📥 Import memory from ChatGPT / Gemini</summary>
+        <p style="font-size:11.5px;color:var(--ink-soft);margin:8px 0;">Export your data from ChatGPT (Settings → Data Controls → Export) or Gemini (Google Takeout), then upload the JSON file here. We only extract durable facts (subjects, preferences, goals) — not raw chat logs.</p>
+        <input type="file" id="importFile" accept="application/json,.json" style="margin-bottom:8px;">
+        <button class="run-btn" id="importBtn">Import</button>
+        <div class="calc-result" id="importStatus" style="display:none;margin-top:8px;"></div>
+      </details>
+
+      <button class="run-btn" id="acctLogoutBtn" style="margin-top:16px;background:transparent;border:1px solid #cdc2a3;color:var(--ink-soft);">Log out</button>
+    </div>
   </div>
 </div>
 
@@ -1439,6 +1484,125 @@ async function runLiteratureSearch(){
 
 document.getElementById('litSearchBtn').addEventListener('click', runLiteratureSearch);
 document.getElementById('litQuery').addEventListener('keydown', e => { if(e.key === 'Enter') runLiteratureSearch(); });
+
+// ---- Account: signup / login / memory / import -------------------------
+const SESSION_KEY = 'pvlab_session_token';
+const SESSION_EMAIL_KEY = 'pvlab_session_email';
+function getSessionToken(){ return localStorage.getItem(SESSION_KEY) || ''; }
+
+// Extend the existing authHeaders() so every request (chat included) also
+// carries the session token when logged in, without touching the access-code gate.
+const _origAuthHeaders = authHeaders;
+authHeaders = function(){
+  const headers = _origAuthHeaders();
+  const token = getSessionToken();
+  if(token) headers['Authorization'] = 'Bearer ' + token;
+  return headers;
+};
+
+const accountLoggedOut = document.getElementById('accountLoggedOut');
+const accountLoggedIn = document.getElementById('accountLoggedIn');
+const acctStatus = document.getElementById('acctStatus');
+const importStatus = document.getElementById('importStatus');
+
+function showAcctStatus(msg, isError){
+  acctStatus.style.display = 'block';
+  acctStatus.textContent = msg;
+  acctStatus.style.color = isError ? '#b3261e' : 'inherit';
+}
+
+function refreshAccountUI(){
+  const token = getSessionToken();
+  const email = localStorage.getItem(SESSION_EMAIL_KEY) || '';
+  if(token){
+    accountLoggedOut.style.display = 'none';
+    accountLoggedIn.style.display = 'block';
+    document.getElementById('acctEmailShown').textContent = email;
+    document.getElementById('accountBtnLabel').textContent = email;
+    loadMemoryList();
+  } else {
+    accountLoggedOut.style.display = 'block';
+    accountLoggedIn.style.display = 'none';
+    document.getElementById('accountBtnLabel').textContent = 'Sign up / Log in';
+  }
+}
+
+async function doAuth(endpoint){
+  const email = document.getElementById('acctEmail').value.trim();
+  const password = document.getElementById('acctPassword').value;
+  if(!email || !password){ showAcctStatus('Email and password required', true); return; }
+  try{
+    const resp = await fetch('/api/' + endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password })
+    });
+    const data = await resp.json();
+    if(!resp.ok || data.error){
+      showAcctStatus(data.error || 'Something went wrong', true);
+      return;
+    }
+    localStorage.setItem(SESSION_KEY, data.token);
+    localStorage.setItem(SESSION_EMAIL_KEY, email);
+    refreshAccountUI();
+  }catch(e){
+    showAcctStatus('Could not reach the server: ' + e.message, true);
+  }
+}
+
+document.getElementById('acctLoginBtn').addEventListener('click', () => doAuth('login'));
+document.getElementById('acctSignupBtn').addEventListener('click', () => doAuth('signup'));
+
+document.getElementById('acctLogoutBtn').addEventListener('click', () => {
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_EMAIL_KEY);
+  refreshAccountUI();
+});
+
+async function loadMemoryList(){
+  const listEl = document.getElementById('memoryList');
+  listEl.textContent = 'Loading…';
+  try{
+    const resp = await fetch('/api/memory-get', { headers: authHeaders() });
+    const data = await resp.json();
+    if(!resp.ok || data.error){ listEl.textContent = 'Could not load memory.'; return; }
+    if(!data.memory || data.memory.length === 0){
+      listEl.textContent = 'Nothing saved yet — it builds up as you chat, or you can import from ChatGPT/Gemini below.';
+      return;
+    }
+    listEl.innerHTML = data.memory.slice(0, 25).map(m => `<div style="margin-bottom:4px;">• ${escapeHtml(m.fact_text)}</div>`).join('');
+  }catch(e){
+    listEl.textContent = 'Could not reach the server.';
+  }
+}
+
+document.getElementById('importBtn').addEventListener('click', async () => {
+  const fileInput = document.getElementById('importFile');
+  const file = fileInput.files[0];
+  importStatus.style.display = 'block';
+  if(!file){ importStatus.textContent = 'Choose a file first.'; return; }
+  importStatus.textContent = 'Reading and processing your export — this can take a moment for large files…';
+  try{
+    const text = await file.text();
+    const resp = await fetch('/api/import-memory', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ exportData: text })
+    });
+    const data = await resp.json();
+    if(!resp.ok || data.error){
+      importStatus.textContent = 'Import failed: ' + (data.error || 'unknown error');
+      return;
+    }
+    importStatus.textContent = `Saved ${data.factsSaved} fact(s) from ${data.chunksProcessed}/${data.totalChunksInFile} chunk(s) of your export.` + (data.note ? ' ' + data.note : '');
+    loadMemoryList();
+  }catch(e){
+    importStatus.textContent = 'Could not process the file: ' + e.message;
+  }
+});
+
+document.getElementById('openAccount').addEventListener('click', () => openModal('accountModal'));
+refreshAccountUI();
 </script>
 
 </body>

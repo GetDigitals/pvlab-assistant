@@ -50,6 +50,27 @@ changes needed, matches the same design as the Termux version.
 environments in the dashboard, or preview deployments will fail with a
 missing-API-key error.
 
+## Accounts + memory (D1 database)
+
+Signup/login and the per-user memory system (`functions/api/signup.js`,
+`login.js`, `memory-get.js`, `memory-save.js`, `import-memory.js`) need a
+D1 database bound as `DB`. Without this binding, the site still works
+exactly as before for guests — the account button just won't do anything
+useful.
+
+1. Cloudflare dashboard → **Workers & Pages → D1 → Create database** (e.g.
+   `pvlab-db`).
+2. Open the new database → **Console** tab → paste the contents of
+   `schema.sql` (in this repo's root) → Execute. This creates the
+   `users`, `sessions`, `user_memory`, and `chat_history` tables.
+3. Go back to your Pages project → **Settings → Functions → D1 database
+   bindings** → Add binding → Variable name `DB` → select `pvlab-db`.
+   Do this for both Production and Preview.
+4. Redeploy (or it picks it up on the next push).
+
+No wrangler CLI / wrangler.toml needed — this whole setup is done through
+the dashboard, same as the GROQ_API_KEY env var above.
+
 ## Testing after deploy
 
 Open the `*.pages.dev` URL Cloudflare gives you, from the client's own

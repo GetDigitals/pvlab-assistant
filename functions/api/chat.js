@@ -1,4 +1,67 @@
+import { getUserFromToken } from '../_lib/auth.js';
+import { getMemoryContextString } from './memory-get.js';
+
 const GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
+
+// Pulls 1-2 durable facts out of a single exchange and stores them (fire-and-forget).
+// Only runs every 3rd exchange to keep Groq usage and D1 writes low.
+async function maybeExtractMemory({ env, userId, userText, replyText, historyLength }) {
+  if (!userId) return;
+  if (historyLength % 6 !== 0) return; // history has [user,assistant] pairs; every 3rd exchange
+
+  try {
+    const groqKey = env.GROQ_API_KEY;
+    if (!groqKey) return;
+
+    const extractPrompt = `From this exchange, extract at most 1-2 durable facts about the student (subject focus, preference, ongoing project/thesis topic, working style). Return ONLY a JSON array like [{"text":"...","category":"subject|style|goal|general"}]. If nothing durable, return [].
+User: ${userText}
+Assistant: ${replyText}`;
+
+    const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${groqKey}` },
+      body: JSON.stringify({
+        model: env.GROQ_MODEL || 'openai/gpt-oss-120b',
+        messages: [{ role: 'user', content: extractPrompt }],
+        max_tokens: 300,
+        temperature: 0.2
+      })
+    });
+    const data = await resp.json();
+    const raw = data.choices?.[0]?.message?.content || '[]';
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+    const facts = JSON.parse(cleaned);
+    if (!Array.isArray(facts) || facts.length === 0) return;
+
+    const now = Date.now();
+    for (const fact of facts) {
+      const text = String(fact.text || '').trim();
+      const category = String(fact.category || 'general').trim();
+      if (!text) continue;
+      const existing = await env.DB.prepare(
+        'SELECT id FROM user_memory WHERE user_id = ? AND fact_text = ?'
+      ).bind(userId, text).first();
+      if (existing) continue;
+      const id = crypto.randomUUID();
+      await env.DB.prepare(
+        'INSERT INTO user_memory (id, user_id, category, fact_text, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+      ).bind(id, userId, category, text, 'chat', now, now).run();
+    }
+
+    // trim to storage cap
+    const { results: countRows } = await env.DB.prepare(
+      'SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC'
+    ).bind(userId).all();
+    if (countRows.length > 150) {
+      for (const row of countRows.slice(150)) {
+        await env.DB.prepare('DELETE FROM user_memory WHERE id = ?').bind(row.id).run();
+      }
+    }
+  } catch (err) {
+    // memory extraction failing should never break the chat response
+    console.error('memory extraction failed', err);
+  }
+}
 
 // ---- Shared instructions for charts / diagrams / tables ----------------
 const VISUAL_FORMAT = `
@@ -64,8 +127,21 @@ export async function onRequestPost(context) {
     }
 
     const PROVIDER = context.env.PROVIDER || 'groq';
-    const system = MODULES[module];
     const userText = message || 'Please analyze this image and explain what it shows.';
+
+    // Memory is optional: only kicks in if DB is bound AND the user sent a valid session token.
+    // Guest/logged-out users still work exactly as before.
+    let userId = null;
+    let memoryBlock = '';
+    if (context.env.DB) {
+      try {
+        userId = await getUserFromToken(context.request, context.env);
+        if (userId) memoryBlock = await getMemoryContextString(userId, context.env);
+      } catch (err) {
+        console.error('memory lookup failed', err);
+      }
+    }
+    const system = MODULES[module] + (memoryBlock ? '\n\n' + memoryBlock : '');
 
     // ---- Image analysis path (Groq vision model, no chat history reuse) ----
     if (image) {
@@ -119,6 +195,13 @@ export async function onRequestPost(context) {
       const data = await resp.json();
       if (!resp.ok) return jsonResponse({ error: data.error || data }, resp.status);
       const text = stripThink(data.choices?.[0]?.message?.content || '');
+
+      if (userId) {
+        context.waitUntil(maybeExtractMemory({
+          env: context.env, userId, userText, replyText: text, historyLength: history.length
+        }));
+      }
+
       return jsonResponse({ reply: text, provider: 'groq', model });
 
     } else if (PROVIDER === 'anthropic') {
