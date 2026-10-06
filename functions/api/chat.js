@@ -63,6 +63,34 @@ Assistant: ${replyText}`;
   }
 }
 
+// Saves one exchange (user + assistant message) to chat_history for cross-device sync.
+// Trims each user+module thread to the most recent 200 messages to keep storage bounded.
+async function saveChatTurn({ env, userId, module, userText, replyText }) {
+  if (!userId) return;
+  try {
+    const now = Date.now();
+    await env.DB.batch([
+      env.DB.prepare(
+        'INSERT INTO chat_history (id, user_id, role, content, module, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(crypto.randomUUID(), userId, 'user', userText, module, now),
+      env.DB.prepare(
+        'INSERT INTO chat_history (id, user_id, role, content, module, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).bind(crypto.randomUUID(), userId, 'assistant', replyText, module, now + 1)
+    ]);
+
+    const { results: countRows } = await env.DB.prepare(
+      'SELECT id FROM chat_history WHERE user_id = ? AND module = ? ORDER BY created_at DESC'
+    ).bind(userId, module).all();
+    if (countRows.length > 200) {
+      for (const row of countRows.slice(200)) {
+        await env.DB.prepare('DELETE FROM chat_history WHERE id = ?').bind(row.id).run();
+      }
+    }
+  } catch (err) {
+    console.error('chat history save failed', err);
+  }
+}
+
 // ---- Shared instructions for charts / diagrams / tables ----------------
 const VISUAL_FORMAT = `
 
@@ -197,6 +225,7 @@ export async function onRequestPost(context) {
       const text = stripThink(data.choices?.[0]?.message?.content || '');
 
       if (userId) {
+        context.waitUntil(saveChatTurn({ env: context.env, userId, module, userText, replyText: text }));
         context.waitUntil(maybeExtractMemory({
           env: context.env, userId, userText, replyText: text, historyLength: history.length
         }));
@@ -227,6 +256,11 @@ export async function onRequestPost(context) {
       const data = await resp.json();
       if (!resp.ok) return jsonResponse({ error: data.error || data }, resp.status);
       const text = stripThink((data.content || []).map(b => b.text || '').join('\n'));
+
+      if (userId) {
+        context.waitUntil(saveChatTurn({ env: context.env, userId, module, userText, replyText: text }));
+      }
+
       return jsonResponse({ reply: text, provider: 'anthropic', model });
 
     } else {

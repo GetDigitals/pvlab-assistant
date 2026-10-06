@@ -71,6 +71,14 @@ useful.
 No wrangler CLI / wrangler.toml needed — this whole setup is done through
 the dashboard, same as the GROQ_API_KEY env var above.
 
+Once `DB` is bound and the schema is applied, logged-in users get:
+- Auto-extracted memory (preferences/subjects/goals) injected into the system
+  prompt on every chat request.
+- Per-module chat history synced to D1 (`chat_history` table) — switching
+  devices while logged in pulls that module's history from the server
+  instead of relying on localStorage. Guests still get the old
+  localStorage-only behavior.
+
 ## Testing after deploy
 
 Open the `*.pages.dev` URL Cloudflare gives you, from the client's own

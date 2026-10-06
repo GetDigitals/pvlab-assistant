@@ -982,12 +982,37 @@ function resetThreadTo(modKey){
   });
 }
 
-document.getElementById('clearHistory').addEventListener('click', () => {
+document.getElementById('clearHistory').addEventListener('click', async () => {
   if(!confirm('Clear this conversation? This cannot be undone.')) return;
   chatHistory[currentMod] = [];
   saveHistory(currentMod, []);
   resetThreadTo(currentMod);
+  if(getSessionToken()){
+    try{
+      await fetch('/api/chat-history?module=' + encodeURIComponent(currentMod), {
+        method: 'DELETE', headers: authHeaders()
+      });
+    }catch(e){ /* local clear already happened; server clear can be retried later */ }
+  }
 });
+
+// Modules whose server-side history has already been fetched this page load,
+// so we don't re-fetch every time the user flips back to a tab they already loaded.
+const syncedModules = new Set();
+
+async function syncModuleFromServer(mod){
+  if(!getSessionToken() || syncedModules.has(mod)) return;
+  try{
+    const resp = await fetch('/api/chat-history?module=' + encodeURIComponent(mod), { headers: authHeaders() });
+    const data = await resp.json();
+    if(resp.ok && Array.isArray(data.history) && data.history.length){
+      chatHistory[mod] = data.history;
+      saveHistory(mod, data.history);
+      if(mod === currentMod) resetThreadTo(mod);
+    }
+    syncedModules.add(mod);
+  }catch(e){ /* fall back silently to whatever's in localStorage */ }
+}
 
 document.querySelectorAll('.mod-btn[data-mod]').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -996,6 +1021,7 @@ document.querySelectorAll('.mod-btn[data-mod]').forEach(btn => {
     currentMod = btn.dataset.mod;
     topTitle.textContent = modules[currentMod].title;
     resetThreadTo(currentMod);
+    syncModuleFromServer(currentMod);
   });
 });
 
@@ -1520,6 +1546,7 @@ function refreshAccountUI(){
     document.getElementById('acctEmailShown').textContent = email;
     document.getElementById('accountBtnLabel').textContent = email;
     loadMemoryList();
+    syncModuleFromServer(currentMod);
   } else {
     accountLoggedOut.style.display = 'block';
     accountLoggedIn.style.display = 'none';
