@@ -685,7 +685,7 @@
       <div class="ctx"><button class="clear-btn" id="clearHistory" title="Clear this conversation">🗑 Clear</button></div>
     </div>
     <div class="thread" id="thread"></div>
-    <div class="hint">Connected to PVLab backend (Groq / openai/gpt-oss-120b). Literature Search (Semantic Scholar) and real irradiance data (PVGIS) are live — see the TOOLS section in the sidebar.</div>
+    <div class="hint">Connected to PVLab backend (Groq / openai/gpt-oss-120b). Literature Search (Semantic Scholar) and real irradiance data (PVGIS) are live — see the TOOLS section in the sidebar. <span id="usageLine" style="display:block;margin-top:4px;"></span></div>
     <div class="image-preview" id="imagePreview">
       <img id="previewImg" src="" alt="attached image">
       <button id="removeImage">✕</button>
@@ -1315,6 +1315,14 @@ async function sendMessage(){
     }
 
     const data = await response.json();
+    if(data && data.usage) renderUsage(data.usage);
+
+    if(response.status === 429 && data.limit_reached){
+      loadingDiv.remove();
+      addMsg('ai', '⏳ ' + escapeHtml(String(data.error)), 'guidance', 'LIMIT REACHED');
+      sendBtn.disabled = false;
+      return;
+    }
 
     if(!response.ok || data.error){
       loadingDiv.remove();
@@ -1571,6 +1579,7 @@ async function doAuth(endpoint){
     localStorage.setItem(SESSION_KEY, data.token);
     localStorage.setItem(SESSION_EMAIL_KEY, email);
     refreshAccountUI();
+    loadUsage();
   }catch(e){
     showAcctStatus('Could not reach the server: ' + e.message, true);
   }
@@ -1583,6 +1592,7 @@ document.getElementById('acctLogoutBtn').addEventListener('click', () => {
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_EMAIL_KEY);
   refreshAccountUI();
+  loadUsage();
 });
 
 async function loadMemoryList(){
@@ -1627,8 +1637,25 @@ document.getElementById('importBtn').addEventListener('click', async () => {
   }
 });
 
+// ---- Usage counter ("X of Y messages left today") ----------------------
+function renderUsage(u){
+  const el = document.getElementById('usageLine');
+  if(!el || !u || typeof u.limit !== 'number') return;
+  const left = Math.max(u.limit - u.used, 0);
+  const label = u.plan === 'pro' ? 'Pro' : (u.plan === 'free' ? 'Free plan' : 'Guest');
+  el.textContent = `${label}: ${left} of ${u.limit} messages left today` + (u.plan === 'guest' ? ' — sign up for more' : '');
+}
+async function loadUsage(){
+  try{
+    const resp = await fetch('/api/usage', { headers: authHeaders() });
+    const data = await resp.json();
+    if(data && data.enabled) renderUsage(data);
+  }catch(e){ /* usage line just stays empty */ }
+}
+
 document.getElementById('openAccount').addEventListener('click', () => openModal('accountModal'));
 refreshAccountUI();
+loadUsage();
 </script>
 
 </body>

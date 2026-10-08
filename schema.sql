@@ -5,7 +5,17 @@ CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  plan TEXT NOT NULL DEFAULT 'free',   -- 'free' | 'pro'
+  plan_expires_at INTEGER              -- ms epoch; NULL = no expiry
+);
+
+-- Daily message counters for usage limits. key = 'u:<userId>' | 'ip:<ip>' | 'imp:<userId>'
+CREATE TABLE IF NOT EXISTS usage_counts (
+  key TEXT NOT NULL,
+  day TEXT NOT NULL,                   -- UTC day, YYYY-MM-DD
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (key, day)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (

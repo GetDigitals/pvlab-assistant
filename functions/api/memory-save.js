@@ -3,18 +3,10 @@ import { getUserFromToken, jsonResponse } from "../_lib/auth.js";
 const MAX_FACTS_PER_USER = 150; // hard cap to keep storage + system-prompt size small
 
 async function trimToCap(userId, env) {
-  const { results: countRows } = await env.DB.prepare(
-    "SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC"
-  )
-    .bind(userId)
-    .all();
-
-  if (countRows.length > MAX_FACTS_PER_USER) {
-    const toDelete = countRows.slice(MAX_FACTS_PER_USER).map((r) => r.id);
-    for (const id of toDelete) {
-      await env.DB.prepare("DELETE FROM user_memory WHERE id = ?").bind(id).run();
-    }
-  }
+  // single statement — D1 free plan allows only 50 queries per request
+  await env.DB.prepare(
+    'DELETE FROM user_memory WHERE user_id = ? AND id NOT IN (SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?)'
+  ).bind(userId, userId, MAX_FACTS_PER_USER).run();
 }
 
 // POST /api/memory-save  body: { facts: [{text, category}], source: "chat" }

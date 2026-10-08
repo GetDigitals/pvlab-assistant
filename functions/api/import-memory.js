@@ -1,8 +1,12 @@
 import { getUserFromToken, jsonResponse } from "../_lib/auth.js";
+import { limitsFromEnv, consume, refund } from "../_lib/usage.js";
 
 const MAX_FACTS_PER_USER = 150;
 const CHUNK_SIZE = 15000; // characters per AI extraction call
 const MAX_CHUNKS_PER_IMPORT = 20; // cost control — caps how much of a huge export we process in one go
+// D1 free plan allows only 50 queries per request. Budget for one import:
+// auth 1 + usage 1-2 + existing-facts read 1 + inserts (<= MAX_NEW_FACTS) + trim 1.
+const MAX_NEW_FACTS_PER_IMPORT = 30;
 
 async function extractFactsWithAI(textChunk, env) {
   const prompt = `You will be given raw exported chat data from an AI assistant (ChatGPT or Gemini).
@@ -39,20 +43,7 @@ ${textChunk}`;
   }
 }
 
-async function trimToCap(userId, env) {
-  const { results: countRows } = await env.DB.prepare(
-    "SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC"
-  )
-    .bind(userId)
-    .all();
-
-  if (countRows.length > MAX_FACTS_PER_USER) {
-    const toDelete = countRows.slice(MAX_FACTS_PER_USER).map((r) => r.id);
-    for (const id of toDelete) {
-      await env.DB.prepare("DELETE FROM user_memory WHERE id = ?").bind(id).run();
-    }
-  }
-}
+const norm = (t) => String(t || "").trim().toLowerCase().replace(/\s+/g, " ");
 
 // POST /api/import-memory  body: { exportData: <string or parsed JSON from ChatGPT/Gemini export> }
 export async function onRequestPost(context) {
@@ -60,12 +51,30 @@ export async function onRequestPost(context) {
   const userId = await getUserFromToken(request, env);
   if (!userId) return jsonResponse({ error: "Unauthorized" }, 401);
 
+  // Imports are the most expensive thing a user can trigger (up to 20 AI calls) — cap per day.
+  const importKey = `imp:${userId}`;
+  let importCharged = false;
+  try {
+    const importLimit = limitsFromEnv(env).import;
+    const r = await consume(env, importKey, 1, importLimit);
+    if (!r.allowed) {
+      return jsonResponse({
+        error: `Import limit reached (${importLimit} per day). Try again tomorrow (resets at 00:00 UTC).`,
+        limit_reached: true,
+      }, 429);
+    }
+    importCharged = true;
+  } catch (err) {
+    console.error("import limit check failed (failing open)", err);
+  }
+
   try {
     const body = await request.json();
     const rawText =
       typeof body.exportData === "string" ? body.exportData : JSON.stringify(body.exportData || "");
 
     if (!rawText || rawText.length < 10) {
+      if (importCharged) await refund(env, importKey, 1);
       return jsonResponse({ error: "exportData required" }, 400);
     }
 
@@ -82,43 +91,57 @@ export async function onRequestPost(context) {
       allFacts = allFacts.concat(facts);
     }
 
-    const now = Date.now();
-    let savedCount = 0;
+    // Dedupe in memory against what's already saved (1 query instead of 1 per fact).
+    const { results: existingRows } = await env.DB.prepare(
+      "SELECT fact_text FROM user_memory WHERE user_id = ?"
+    ).bind(userId).all();
+    const seen = new Set(existingRows.map((r) => norm(r.fact_text)));
 
+    const now = Date.now();
+    const toInsert = [];
     for (const fact of allFacts) {
       const text = String(fact.text || "").trim();
       const category = String(fact.category || "imported").trim();
-      if (!text) continue;
-
-      const existing = await env.DB.prepare(
-        "SELECT id FROM user_memory WHERE user_id = ? AND fact_text = ?"
-      )
-        .bind(userId, text)
-        .first();
-      if (existing) continue;
-
-      const id = crypto.randomUUID();
-      await env.DB.prepare(
-        "INSERT INTO user_memory (id, user_id, category, fact_text, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
-      )
-        .bind(id, userId, category, text, "import", now, now)
-        .run();
-      savedCount++;
+      const key = norm(text);
+      if (!text || seen.has(key)) continue;
+      seen.add(key);
+      toInsert.push({ text, category });
+      if (toInsert.length >= MAX_NEW_FACTS_PER_IMPORT) break;
     }
 
-    await trimToCap(userId, env);
+    if (toInsert.length) {
+      await env.DB.batch(
+        toInsert.map((f) =>
+          env.DB.prepare(
+            "INSERT INTO user_memory (id, user_id, category, fact_text, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+          ).bind(crypto.randomUUID(), userId, f.category, f.text, "import", now, now)
+        )
+      );
+    }
+
+    // Enforce the storage cap with a single statement.
+    await env.DB.prepare(
+      "DELETE FROM user_memory WHERE user_id = ? AND id NOT IN (SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC LIMIT ?)"
+    ).bind(userId, userId, MAX_FACTS_PER_USER).run();
+
+    const hitFactCap = toInsert.length >= MAX_NEW_FACTS_PER_IMPORT;
+    const notes = [];
+    if (chunks.length > MAX_CHUNKS_PER_IMPORT) {
+      notes.push("File was larger than the per-import processing cap, so only the first portion was processed.");
+    }
+    if (hitFactCap) {
+      notes.push(`Saved the first ${MAX_NEW_FACTS_PER_IMPORT} new facts; importing again later will add more.`);
+    }
 
     return jsonResponse({
       success: true,
       chunksProcessed: chunksToProcess.length,
       totalChunksInFile: chunks.length,
-      factsSaved: savedCount,
-      note:
-        chunks.length > MAX_CHUNKS_PER_IMPORT
-          ? "File was larger than the per-import processing cap; only the first portion was processed. User can re-run import to continue (dedupe will skip what's already saved)."
-          : undefined,
+      factsSaved: toInsert.length,
+      note: notes.length ? notes.join(" ") : undefined,
     });
   } catch (err) {
+    if (importCharged) await refund(env, importKey, 1);
     return jsonResponse({ error: "Import failed", detail: String(err) }, 500);
   }
 }

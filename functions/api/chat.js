@@ -1,5 +1,6 @@
 import { getUserFromToken } from '../_lib/auth.js';
 import { getMemoryContextString } from './memory-get.js';
+import { getPlan, limitsFromEnv, usageKeyFor, consume, refund, pruneOldUsage, limitMessage } from '../_lib/usage.js';
 
 const GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
 
@@ -48,15 +49,10 @@ Assistant: ${replyText}`;
       ).bind(id, userId, category, text, 'chat', now, now).run();
     }
 
-    // trim to storage cap
-    const { results: countRows } = await env.DB.prepare(
-      'SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC'
-    ).bind(userId).all();
-    if (countRows.length > 150) {
-      for (const row of countRows.slice(150)) {
-        await env.DB.prepare('DELETE FROM user_memory WHERE id = ?').bind(row.id).run();
-      }
-    }
+    // trim to storage cap (single statement — D1 free plan allows only 50 queries per request)
+    await env.DB.prepare(
+      'DELETE FROM user_memory WHERE user_id = ? AND id NOT IN (SELECT id FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC LIMIT 150)'
+    ).bind(userId, userId).run();
   } catch (err) {
     // memory extraction failing should never break the chat response
     console.error('memory extraction failed', err);
@@ -78,14 +74,9 @@ async function saveChatTurn({ env, userId, module, userText, replyText }) {
       ).bind(crypto.randomUUID(), userId, 'assistant', replyText, module, now + 1)
     ]);
 
-    const { results: countRows } = await env.DB.prepare(
-      'SELECT id FROM chat_history WHERE user_id = ? AND module = ? ORDER BY created_at DESC'
-    ).bind(userId, module).all();
-    if (countRows.length > 200) {
-      for (const row of countRows.slice(200)) {
-        await env.DB.prepare('DELETE FROM chat_history WHERE id = ?').bind(row.id).run();
-      }
-    }
+    await env.DB.prepare(
+      'DELETE FROM chat_history WHERE user_id = ? AND module = ? AND id NOT IN (SELECT id FROM chat_history WHERE user_id = ? AND module = ? ORDER BY created_at DESC LIMIT 200)'
+    ).bind(userId, module, userId, module).run();
   } catch (err) {
     console.error('chat history save failed', err);
   }
@@ -178,6 +169,32 @@ export async function onRequestPost(context) {
     }
     const system = MODULES[module] + (memoryBlock ? '\n\n' + memoryBlock : '');
 
+    // ---- Daily usage limit (cost control). Fails open if the usage table isn't migrated yet. ----
+    let usageInfo = null;
+    let usageKey = null;
+    const usageCost = image ? 2 : 1; // vision requests cost more, so they count double
+    if (context.env.DB) {
+      try {
+        const plan = await getPlan(context.env, userId);
+        const limit = limitsFromEnv(context.env)[plan];
+        usageKey = usageKeyFor(context.request, userId);
+        const r = await consume(context.env, usageKey, usageCost, limit);
+        usageInfo = { plan, used: r.used, limit };
+        if (!r.allowed) {
+          return jsonResponse({
+            error: limitMessage(plan, limit),
+            limit_reached: true,
+            usage: { plan, used: Math.min(r.used, limit), limit }
+          }, 429);
+        }
+        if (Math.random() < 0.02) context.waitUntil(pruneOldUsage(context.env));
+      } catch (err) {
+        console.error('usage check failed (failing open)', err);
+        usageKey = null;
+      }
+    }
+    const refundUsage = () => (usageKey ? refund(context.env, usageKey, usageCost) : null);
+
     // ---- Image analysis path (Groq vision model, no chat history reuse) ----
     if (image) {
       if (PROVIDER !== 'groq') {
@@ -206,9 +223,9 @@ export async function onRequestPost(context) {
         body: JSON.stringify(body)
       });
       const data = await resp.json();
-      if (!resp.ok) return jsonResponse({ error: data.error || data }, resp.status);
+      if (!resp.ok) { await refundUsage(); return jsonResponse({ error: data.error || data }, resp.status); }
       const text = stripThink(data.choices?.[0]?.message?.content || '');
-      return jsonResponse({ reply: text, provider: 'groq', model: GROQ_VISION_MODEL });
+      return jsonResponse({ reply: text, provider: 'groq', model: GROQ_VISION_MODEL, usage: usageInfo });
     }
 
     // ---- Normal text path -----------------------------------------------
@@ -228,7 +245,7 @@ export async function onRequestPost(context) {
         body: JSON.stringify(body)
       });
       const data = await resp.json();
-      if (!resp.ok) return jsonResponse({ error: data.error || data }, resp.status);
+      if (!resp.ok) { await refundUsage(); return jsonResponse({ error: data.error || data }, resp.status); }
       const text = stripThink(data.choices?.[0]?.message?.content || '');
 
       if (userId) {
@@ -238,7 +255,7 @@ export async function onRequestPost(context) {
         }));
       }
 
-      return jsonResponse({ reply: text, provider: 'groq', model });
+      return jsonResponse({ reply: text, provider: 'groq', model, usage: usageInfo });
 
     } else if (PROVIDER === 'anthropic') {
       const anthropicKey = context.env.ANTHROPIC_API_KEY;
@@ -261,14 +278,14 @@ export async function onRequestPost(context) {
         body: JSON.stringify(body)
       });
       const data = await resp.json();
-      if (!resp.ok) return jsonResponse({ error: data.error || data }, resp.status);
+      if (!resp.ok) { await refundUsage(); return jsonResponse({ error: data.error || data }, resp.status); }
       const text = stripThink((data.content || []).map(b => b.text || '').join('\n'));
 
       if (userId) {
         context.waitUntil(saveChatTurn({ env: context.env, userId, module, userText, replyText: text }));
       }
 
-      return jsonResponse({ reply: text, provider: 'anthropic', model });
+      return jsonResponse({ reply: text, provider: 'anthropic', model, usage: usageInfo });
 
     } else {
       return jsonResponse({ error: `Unknown provider "${PROVIDER}"` }, 500);

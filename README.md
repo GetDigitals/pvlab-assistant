@@ -84,3 +84,36 @@ Once `DB` is bound and the schema is applied, logged-in users get:
 Open the `*.pages.dev` URL Cloudflare gives you, from the client's own
 network in Algeria (mobile data + home WiFi both) to confirm no regional
 blocking issue, before treating this as the final link to share.
+
+## Usage limits (cost control)
+
+Every AI message counts against a per-UTC-day limit, by plan:
+
+| Plan  | Who | Default daily limit | Env var |
+|-------|-----|---------------------|---------|
+| guest | not logged in (counted per IP) | 5   | `GUEST_DAILY_LIMIT` |
+| free  | logged in | 15  | `FREE_DAILY_LIMIT` |
+| pro   | `users.plan = 'pro'` (and not expired) | 200 | `PRO_DAILY_LIMIT` |
+
+Image questions count double. Memory imports are capped separately (`IMPORT_DAILY_LIMIT`,
+default 3 per user per day). If the AI provider errors, the message is refunded.
+Env vars are optional — set them in Pages → Settings → Environment variables to change
+the defaults (needs a redeploy).
+
+**Existing database?** Run `migrations/002_usage_limits.sql` once in the D1 console
+(adds `users.plan`, `users.plan_expires_at` and the `usage_counts` table). Until you do,
+limits fail open (chat keeps working, just unlimited).
+
+**Manually granting a paid plan** (e.g. after a WhatsApp/manual payment), in the D1 console:
+
+```sql
+-- 30 days of pro:
+UPDATE users SET plan='pro', plan_expires_at=(strftime('%s','now')+30*86400)*1000 WHERE email='student@example.com';
+-- pro with no expiry:
+UPDATE users SET plan='pro', plan_expires_at=NULL WHERE email='student@example.com';
+-- back to free:
+UPDATE users SET plan='free', plan_expires_at=NULL WHERE email='student@example.com';
+```
+
+Note: Cloudflare's free plan allows only 50 D1 queries per request, so the memory/import
+code deliberately uses single-statement trims and in-memory dedupe.
