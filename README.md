@@ -117,3 +117,21 @@ UPDATE users SET plan='free', plan_expires_at=NULL WHERE email='student@example.
 
 Note: Cloudflare's free plan allows only 50 D1 queries per request, so the memory/import
 code deliberately uses single-statement trims and in-memory dedupe.
+
+## Document upload (PDF / text)
+
+The 📎 button accepts images, PDFs and .txt/.md files. For PDFs/text, the browser extracts the
+text itself (pdf.js, loaded from cdnjs on first use) — nothing is parsed server-side, so it fits
+Cloudflare's free-plan CPU limits. The text is split into ~1500-character chunks; for every
+question only the most relevant chunks (keyword scoring, ≤ ~9000 characters) are sent to the
+AI together with page markers like `[p.12]`. The server caps and sanitizes the excerpts again
+and tells the model to treat them as reference material, never as instructions.
+
+- Limits: 15 MB per file, first 300 pages, ~600k characters.
+- The document stays attached for follow-up questions until removed or the page is reloaded
+  (it is not stored on the server).
+- A question about an attached document counts as 2 messages against the daily limit
+  (bigger prompts), same as an image question.
+- Scanned PDFs (pictures of pages, no text layer) can't be read — there is no OCR.
+- Retrieval is simple keyword matching, not embeddings: generic questions ("summarize this")
+  sample evenly across the document instead.

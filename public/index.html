@@ -308,6 +308,36 @@
     flex-shrink:0;
   }
   .attach-btn:hover{ background:#efe3cf; }
+  .doc-chip{
+    display:none;
+    align-items:center;
+    gap:8px;
+    padding:0 26px 8px;
+    font-size:12px;
+    color:var(--ink-soft);
+  }
+  .doc-chip #docChipText{
+    background:#efe3cf;
+    border:1px solid #cdc2a3;
+    border-radius:3px;
+    padding:4px 8px;
+    max-width:100%;
+    overflow:hidden;
+    text-overflow:ellipsis;
+    white-space:nowrap;
+  }
+  .doc-chip button{
+    background:#e8574f;
+    color:#fff;
+    border:none;
+    border-radius:50%;
+    width:20px;
+    height:20px;
+    cursor:pointer;
+    font-size:11px;
+    line-height:1;
+  }
+  .doc-tag{ font-size:11px; opacity:.75; margin-bottom:4px; }
   .image-preview{
     display:none;
     align-items:center;
@@ -691,10 +721,14 @@
       <button id="removeImage">✕</button>
       <span style="font-size:11px;color:var(--ink-soft);">image attached — will be analyzed</span>
     </div>
+    <div class="doc-chip" id="docChip">
+      <span id="docChipText"></span>
+      <button id="removeDoc" title="Remove document">✕</button>
+    </div>
     <div class="composer">
-      <label class="attach-btn" title="Attach an image (datasheet, graph, problem photo)">
+      <label class="attach-btn" title="Attach an image, a PDF or a text file (datasheet, lecture notes, problem photo)">
         📎
-        <input type="file" id="imageInput" accept="image/*" style="display:none;">
+        <input type="file" id="imageInput" accept="image/*,application/pdf,.pdf,.txt,.md,text/plain" style="display:none;">
       </label>
       <input id="input" type="text" placeholder="e.g. Size a standalone PV system for a 2kW load..." />
       <button id="send">Send</button>
@@ -947,9 +981,155 @@ const imagePreview = document.getElementById('imagePreview');
 const previewImg = document.getElementById('previewImg');
 const removeImageBtn = document.getElementById('removeImage');
 
-imageInput.addEventListener('change', () => {
+// ---- Document attachments (PDF / text) ---------------------------------
+// Text is extracted in the browser (pdf.js), split into chunks, and for each question only the
+// most relevant chunks are sent to the AI — so long lecture PDFs work without sending whole files.
+// The document stays attached for follow-up questions until removed or the page is reloaded.
+const DOC_MAX_BYTES = 15 * 1024 * 1024;
+const DOC_MAX_PAGES = 300;
+const DOC_MAX_CHARS = 600000;
+const DOC_CHUNK_CHARS = 1500;
+const DOC_EXCERPT_CHARS = 9000;
+const PDFJS_VERSION = '3.11.174';
+let attachedDoc = null; // { name, pages, chunks: [{ref, text}], truncated }
+let pdfjsLoading = null;
+const docChip = document.getElementById('docChip');
+const docChipText = document.getElementById('docChipText');
+
+function loadPdfJs(){
+  if(window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if(pdfjsLoading) return pdfjsLoading;
+  pdfjsLoading = new Promise((resolve, reject) => {
+    const sc = document.createElement('script');
+    sc.src = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.min.js`;
+    sc.onload = () => {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}/pdf.worker.min.js`;
+      resolve(window.pdfjsLib);
+    };
+    sc.onerror = () => { pdfjsLoading = null; reject(new Error('Could not load the PDF reader. Check your connection and try again.')); };
+    document.head.appendChild(sc);
+  });
+  return pdfjsLoading;
+}
+
+function pushChunks(chunks, ref, text){
+  for(let i = 0; i < text.length; i += DOC_CHUNK_CHARS){
+    chunks.push({ ref, text: text.slice(i, i + DOC_CHUNK_CHARS) });
+  }
+}
+
+async function extractPdfChunks(file, onProgress){
+  const pdfjs = await loadPdfJs();
+  const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+  const pages = Math.min(pdf.numPages, DOC_MAX_PAGES);
+  const chunks = [];
+  let total = 0;
+  for(let p = 1; p <= pages; p++){
+    const page = await pdf.getPage(p);
+    const tc = await page.getTextContent();
+    const text = tc.items.map(i => i.str).join(' ').replace(/\s+/g, ' ').trim();
+    if(text){ pushChunks(chunks, 'p.' + p, text); total += text.length; }
+    if(onProgress) onProgress(p, pages);
+    if(total >= DOC_MAX_CHARS) break;
+  }
+  return { chunks, pages: pdf.numPages, truncated: pdf.numPages > DOC_MAX_PAGES || total >= DOC_MAX_CHARS };
+}
+
+function extractTextChunks(raw){
+  const clean = raw.replace(/\r/g, '').replace(/[ \t]+/g, ' ').trim();
+  const text = clean.slice(0, DOC_MAX_CHARS);
+  const chunks = [];
+  for(let i = 0, n = 1; i < text.length; i += DOC_CHUNK_CHARS, n++){
+    chunks.push({ ref: 'part ' + n, text: text.slice(i, i + DOC_CHUNK_CHARS) });
+  }
+  return { chunks, pages: null, truncated: clean.length > DOC_MAX_CHARS };
+}
+
+function renderDocChip(){
+  if(!attachedDoc){ docChip.style.display = 'none'; return; }
+  const size = attachedDoc.pages ? attachedDoc.pages + ' pages' : 'text file';
+  docChipText.textContent = `📄 ${attachedDoc.name} · ${size}` + (attachedDoc.truncated ? ' · first part only' : '') + ' · questions on it count as 2 messages';
+  docChip.style.display = 'flex';
+}
+
+function clearDoc(){ attachedDoc = null; renderDocChip(); }
+function clearPendingImage(){
+  pendingImage = null;
+  imageInput.value = '';
+  imagePreview.style.display = 'none';
+}
+
+async function attachDocument(file, isPdf){
+  if(file.size > DOC_MAX_BYTES){
+    alert('That file is larger than 15 MB. Please attach a smaller file or just the chapter you need.');
+    return;
+  }
+  clearPendingImage();
+  docChip.style.display = 'flex';
+  docChipText.textContent = '⏳ Reading ' + file.name + '…';
+  try{
+    const result = isPdf
+      ? await extractPdfChunks(file, (p, n) => { docChipText.textContent = `⏳ Reading ${file.name} (${p}/${n})…`; })
+      : extractTextChunks(await file.text());
+    const totalChars = result.chunks.reduce((n, c) => n + c.text.length, 0);
+    if(totalChars < 50) throw new Error('no-text');
+    attachedDoc = { name: file.name, pages: result.pages, chunks: result.chunks, truncated: result.truncated };
+    renderDocChip();
+  }catch(e){
+    clearDoc();
+    alert(e.message === 'no-text'
+      ? 'No readable text found in this file. If it is a scanned PDF (pictures of pages), attach a page as an image instead, or use a text-based version.'
+      : 'Could not read this file: ' + e.message);
+  }
+}
+
+// Lightweight keyword retrieval: score each chunk against the question, send the best few.
+const DOC_STOP = new Set('the and for with that this from are was were have has had you your what which when where how why can could would should about into than then them they their there here also not but its our out any all use used using est les des une que pour dans qui sur avec par pas plus sont comme cette ces aux ses'.split(' '));
+function docTerms(str){
+  return (str.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').match(/[\p{L}\p{N}]{3,}/gu) || []).filter(w => !DOC_STOP.has(w));
+}
+function pickExcerpts(question){
+  const chunks = attachedDoc.chunks;
+  const q = [...new Set(docTerms(question))];
+  let chosen = [];
+  if(q.length){
+    const scored = chunks.map((c, idx) => {
+      if(!c.tf){
+        c.tf = new Map();
+        docTerms(c.text).forEach(w => c.tf.set(w, (c.tf.get(w) || 0) + 1));
+      }
+      let score = 0;
+      q.forEach(w => { const n = c.tf.get(w); if(n) score += 1 + Math.log(n); });
+      return { idx, score };
+    }).filter(x => x.score > 0).sort((a, b) => b.score - a.score || a.idx - b.idx);
+    let used = 0;
+    for(const x of scored){
+      if(chosen.length >= 8 || used + chunks[x.idx].text.length > DOC_EXCERPT_CHARS) break;
+      chosen.push(x.idx);
+      used += chunks[x.idx].text.length;
+    }
+  }
+  if(!chosen.length){ // generic question ("summarize this") or no keyword match: sample across the document
+    const n = Math.min(chunks.length, Math.floor(DOC_EXCERPT_CHARS / DOC_CHUNK_CHARS));
+    for(let i = 0; i < n; i++) chosen.push(n === 1 ? 0 : Math.round(i * (chunks.length - 1) / (n - 1)));
+    chosen = [...new Set(chosen)];
+  }
+  return chosen.sort((a, b) => a - b).map(i => `[${chunks[i].ref}] ${chunks[i].text}`).join('\n\n---\n\n');
+}
+
+document.getElementById('removeDoc').addEventListener('click', clearDoc);
+
+imageInput.addEventListener('change', async () => {
   const file = imageInput.files[0];
   if(!file) return;
+  const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+  const isText = file.type.startsWith('text/') || /\.(txt|md)$/i.test(file.name);
+  if(isPdf || isText){
+    await attachDocument(file, isPdf);
+    imageInput.value = '';
+    return;
+  }
+  clearDoc(); // one attachment at a time
   const reader = new FileReader();
   reader.onload = (e) => {
     pendingImage = e.target.result;
@@ -1276,11 +1456,16 @@ function exportToPDF(text, titlePrefix){
 }
 
 async function sendMessage(){
-  const text = input.value.trim();
+  let text = input.value.trim();
   const imageToSend = pendingImage;
+  const docToSend = (!imageToSend && attachedDoc) ? attachedDoc : null;
+  if(!text && docToSend) text = 'Summarize the key points of this document.';
   if(!text && !imageToSend) return;
 
   let userHtml = escapeHtml(text);
+  if(docToSend){
+    userHtml = `<div class="doc-tag">📄 ${escapeHtml(docToSend.name)}</div>` + userHtml;
+  }
   if(imageToSend){
     userHtml += (text ? '<br>' : '') + `<img src="${imageToSend}" alt="attached image">`;
   }
@@ -1291,7 +1476,7 @@ async function sendMessage(){
   imagePreview.style.display = 'none';
   sendBtn.disabled = true;
 
-  const loadingDiv = addMsg('ai', imageToSend ? '<i>analyzing image…</i>' : '<i>thinking…</i>', 'guidance', 'GUIDANCE');
+  const loadingDiv = addMsg('ai', imageToSend ? '<i>analyzing image…</i>' : (docToSend ? '<i>reading your document…</i>' : '<i>thinking…</i>'), 'guidance', 'GUIDANCE');
 
   try{
     const payload = {
@@ -1300,6 +1485,7 @@ async function sendMessage(){
       history: imageToSend ? [] : chatHistory[currentMod]
     };
     if(imageToSend) payload.image = imageToSend;
+    if(docToSend) payload.document = { name: docToSend.name, text: pickExcerpts(text) };
 
     const response = await fetch(BACKEND_URL, {
       method: "POST",
